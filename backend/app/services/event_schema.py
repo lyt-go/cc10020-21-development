@@ -29,14 +29,20 @@ class EventSchemaService(BaseModuleService):
         "datetime": str, "json": (dict, list), "any": object,
     }
 
+    # 事件信封字段由接入层解释，不参与业务字段的结构匹配。
+    ENVELOPE_FIELDS = {"type", "event_type"}
+
     def validate_event(self, channel_id: int, event_type: str,
                        payload: dict[str, Any]) -> dict[str, Any]:
-        """对接收的事件Payload执行Schema校验。
+        """对接收的事件Payload执行Schema校验，并区分“已确认结构范围”和“未知字段”。
 
         校验流程：
         1. 查找该通道/事件类型下所有已生效的Schema字段定义
-        2. 逐一检查必填字段是否存在、类型是否匹配
-        3. 对缺失的必填字段返回具体错误
+        2. 逐一检查必填字段是否存在、类型是否匹配，通过者进入已确认结构范围
+        3. Payload 中没有结构定义的字段记为未知字段，交给接入层生成处置明细
+
+        未知字段不会让整条事件直接失败（否则永远没有可供补验的记录），
+        但也不会进入 usable_fields，因此不会被送往正式分区。
 
         Args:
             channel_id: Webhook通道ID
@@ -44,7 +50,8 @@ class EventSchemaService(BaseModuleService):
             payload: 事件数据体
 
         Returns:
-            校验结果:{ ok: bool, message: str, missing_fields: list, type_errors: list }
+            校验结果:{ ok, message, schema_found, confirmed_fields, unknown_fields,
+                     usable_fields, missing_fields, type_errors, confirmed_scope, pending_reason }
         """
         # 查找关联通道的已生效schema字段
         schemas = json_store.get_all(self.MODULE)
@@ -55,20 +62,37 @@ class EventSchemaService(BaseModuleService):
             and str(s.get("所属通道", "")) in (str(channel_id), "", "全通道")
         ]
 
-        result = {
+        schema_ids = sorted({int(s.get("id", 0)) for s in matching if s.get("id") is not None})
+        schema_versions = sorted({str(s.get("Schema版本", "")) for s in matching if s.get("Schema版本")})
+        result: dict[str, Any] = {
             "ok": True,
             "message": "结构校验通过",
+            "schema_found": bool(matching),
+            "schema_ids": schema_ids,
+            "schema_versions": schema_versions,
             "missing_fields": [],
             "type_errors": [],
             "checked_fields": len(matching),
+            "confirmed_fields": [],
+            "unknown_fields": [],
+            "usable_fields": {},
+            "pending_fields": [],
+            "confirmed_scope": {
+                "channel_id": channel_id,
+                "event_type": event_type,
+                "fields": [],
+                "schema_ids": schema_ids,
+                "schema_versions": schema_versions,
+            },
+            "pending_reason": "",
         }
 
-        if not matching:
-            # 没有Schema定义时默认通过（宽松校验策略）
-            return result
+        defined_fields = {
+            str(s.get("字段名称", "")): s for s in matching
+            if str(s.get("字段名称", "")).strip()
+        }
 
-        for schema_field in matching:
-            field_name = str(schema_field.get("字段名称", ""))
+        for field_name, schema_field in defined_fields.items():
             field_type = str(schema_field.get("字段类型", "any"))
             is_required = str(schema_field.get("必填标识", "否")) in ("是", "true", "True")
 
@@ -76,6 +100,7 @@ class EventSchemaService(BaseModuleService):
                 if is_required:
                     result["ok"] = False
                     result["missing_fields"].append(field_name)
+                    result["pending_fields"].append(field_name)
                 continue
 
             expected_type = self._TYPE_MAP.get(field_type, object)
@@ -83,22 +108,43 @@ class EventSchemaService(BaseModuleService):
 
             # 类型检查
             if isinstance(expected_type, tuple):
-                if not isinstance(actual_value, expected_type):
-                    result["ok"] = False
-                    result["type_errors"].append({
-                        "field": field_name,
-                        "expected": field_type,
-                        "actual": type(actual_value).__name__,
-                    })
+                type_ok = isinstance(actual_value, expected_type)
             elif expected_type is object:
-                continue
-            elif not isinstance(actual_value, expected_type):
+                type_ok = True
+            else:
+                type_ok = isinstance(actual_value, expected_type)
+
+            if not type_ok:
                 result["ok"] = False
                 result["type_errors"].append({
                     "field": field_name,
                     "expected": field_type,
                     "actual": type(actual_value).__name__,
                 })
+                result["pending_fields"].append(field_name)
+                continue
+
+            result["confirmed_fields"].append(field_name)
+            result["usable_fields"][field_name] = actual_value
+
+        # 未在结构定义中登记的字段：单独标记来源和原因，等待补验，不阻断事件留存。
+        unknown_reason = (
+            "事件结构定义中未登记该字段" if matching
+            else "未找到该通道/事件类型的已生效结构定义"
+        )
+        for field_name, value in payload.items():
+            if field_name in self.ENVELOPE_FIELDS:
+                continue
+            if field_name in defined_fields:
+                continue
+            result["unknown_fields"].append({
+                "field": field_name,
+                "value": value,
+                "reason": unknown_reason,
+            })
+            result["pending_fields"].append(field_name)
+
+        result["confirmed_scope"]["fields"] = list(result["confirmed_fields"])
 
         if not result["ok"]:
             messages = []
@@ -109,7 +155,54 @@ class EventSchemaService(BaseModuleService):
                 messages.append(f"字段类型不匹配: {'; '.join(type_msgs)}")
             result["message"] = " | ".join(messages)
 
+        pending_bits = []
+        if not matching:
+            pending_bits.append("未找到已生效结构定义")
+        elif result["unknown_fields"]:
+            pending_bits.append(
+                "未知字段待补验: " + ", ".join(u["field"] for u in result["unknown_fields"]))
+        if result["type_errors"]:
+            pending_bits.append("字段类型不符待更正")
+        if result["missing_fields"]:
+            pending_bits.append("必填字段缺失")
+        result["pending_reason"] = "；".join(pending_bits)
+
+        if not matching:
+            result["message"] = "结构校验中断：未找到已生效结构定义，原始数据已留存待补验"
+        elif not result["ok"]:
+            result["message"] = result["message"] + "；原始数据已留存待补验"
+        elif result["unknown_fields"]:
+            result["message"] = "结构校验部分通过：" + result["pending_reason"]
+
         return result
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """结构状态流转；标记生效后自动对同一通道/事件类型的待补验记录重新校验。
+
+        结构定义登记在持久化分区里（create_entry 写 json_store），所以这里优先
+        操作持久化记录，避免更新到内存仓库里同 ID 的示例行。
+        """
+        target = self.ACTION_RULES.get(action)
+        if target is None:
+            return super().run_action(entry_id, action)
+
+        stored = json_store.get_by_id(self.MODULE, entry_id)
+        if stored is not None:
+            updated = json_store.update(self.MODULE, entry_id, {
+                "status": target,
+                "pending": target != self.STATUS_ORDER[-1],
+            })
+            if updated is None:
+                return None, f"{self.ENTITY} {entry_id} 更新失败"
+            message = f"{self.ENTITY}已{action}"
+            if action == "标记生效":
+                from app.services.ingest_validation import IngestValidationService
+                revalidated = IngestValidationService().revalidate_for_schema(updated)
+                if revalidated:
+                    message = f"{message}，已重新校验 {len(revalidated)} 条待补验记录"
+            return updated, message
+
+        return super().run_action(entry_id, action)
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         """创建Schema结构定义，附带版本管理和字段去重检查。"""

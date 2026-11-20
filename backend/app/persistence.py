@@ -23,7 +23,12 @@ class JsonStore:
 
     def __init__(self, base_dir: str | None = None) -> None:
         if base_dir is None:
-            base_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store")
+            # 用绝对路径：测试以 `tests/../app` 方式导入时，未规范化的 __file__
+            # 会把 data_store 算到 tests/ 下面去。
+            base_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                "data_store",
+            )
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -36,6 +41,11 @@ class JsonStore:
         partition_path = self._base_dir / partition_dir
         partition_path.mkdir(parents=True, exist_ok=True)
         return partition_path / f"{safe_key}.json"
+
+    @property
+    def base_dir(self) -> Path:
+        """存储根目录；数据湖等附属目录跟随它，便于测试隔离。"""
+        return self._base_dir
 
     def _read_raw(self, key: str) -> dict[str, Any]:
         """从磁盘读取分区的原始数据。"""

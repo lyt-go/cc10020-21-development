@@ -48,11 +48,26 @@ class ValidationRequest(BaseModel):
     source_module: str = ""
 
 
+class RawEventQuery(BaseModel):
+    channel_id: int | None = None
+    event_type: str | None = None
+    outcome: str | None = None
+    page: int = 1
+    size: int = 50
+
+
+class RevalidateRequest(BaseModel):
+    raw_event_id: int | None = None
+    raw_event_ids: list[int] = []
+
+
 @router.post("/webhook-to-lake")
 def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[str, Any]:
-    """链路1: Webhook接收 → 事件解析 → 去重 → 分发路由 → 数据落湖。
+    """链路1: Webhook接收 → 原始接入留存 → 结构校验 → 去重 → 分发 → 正式分区落湖。
 
-    完整覆盖：webhook_channel → event_schema → dedup_filter → dispatch_rule → data_lake_sink。
+    完整覆盖：webhook_channel → webhook_ingest_raw → event_schema →
+    dedup_filter → dispatch_rule → data_lake_sink（formal）。
+    结构校验失败/中断时返回 raw_event_id，原始数据仍可查询和补验。
     """
     from app.services.webhook_channel import WebhookChannelService
     svc = WebhookChannelService()
@@ -63,6 +78,85 @@ def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[s
         headers=payload.headers,
     )
     return result
+
+
+@router.get("/webhook-ingest/raw")
+def pipeline_list_raw_events(
+    channel_id: int | None = None,
+    event_type: str | None = None,
+    outcome: str | None = None,
+    page: int = 1,
+    size: int = 50,
+) -> dict[str, Any]:
+    """查询原始接入数据（来源行），结构校验失败或中断后仍可查到。"""
+    from app.persistence import json_store
+    from app.services.ingest_validation import RAW_MODULE
+    rows = json_store.get_all(RAW_MODULE)
+    if channel_id is not None:
+        rows = [row for row in rows if int(row.get("通道ID", 0)) == channel_id]
+    if event_type:
+        rows = [row for row in rows if row.get("事件类型") == event_type]
+    if outcome:
+        rows = [row for row in rows if row.get("处理结论") == outcome]
+    rows.sort(key=lambda row: str(row.get("接收时间", "")), reverse=True)
+    total = len(rows)
+    start = (page - 1) * size
+    return {"items": rows[start:start + size], "total": total, "page": page, "size": size}
+
+
+@router.get("/webhook-ingest/raw/{raw_event_id}")
+def pipeline_get_raw_event(raw_event_id: int) -> dict[str, Any]:
+    """追溯单笔数据：最初原文、新旧结构结论、未知字段明细与待处理清单。"""
+    from app.services.ingest_validation import IngestValidationService
+    result = IngestValidationService().trace(raw_event_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "原始接入记录不存在"))
+    return result
+
+
+@router.get("/webhook-ingest/unknown-fields")
+def pipeline_list_unknown_fields(
+    raw_event_id: int | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """未知字段处置明细：标出来源行、字段和待补验原因。"""
+    from app.services.ingest_validation import IngestValidationService
+    rows = IngestValidationService().list_unknown_fields(
+        raw_event_id=raw_event_id, status=status)
+    return {"items": rows, "total": len(rows)}
+
+
+@router.get("/webhook-ingest/pending")
+def pipeline_list_pending(status: str | None = None, page: int = 1, size: int = 50) -> dict[str, Any]:
+    """待处理清单：每条来源行一条，说明本次异常原因以供补验。"""
+    from app.services.ingest_validation import IngestValidationService
+    rows, total = IngestValidationService().list_pending(status=status, page=page, size=size)
+    return {"items": rows, "total": total, "page": page, "size": size}
+
+
+@router.post("/webhook-ingest/revalidate")
+def pipeline_revalidate(request: RevalidateRequest) -> dict[str, Any]:
+    """补验：补齐结构定义后，对同一来源行重新校验并补写正式分区。"""
+    from app.services.ingest_validation import IngestValidationService
+    svc = IngestValidationService()
+    ids = list(request.raw_event_ids)
+    if request.raw_event_id is not None and request.raw_event_id not in ids:
+        ids.insert(0, request.raw_event_id)
+    if not ids:
+        raise HTTPException(status_code=400, detail="需要提供 raw_event_id 或 raw_event_ids")
+    results = [svc.revalidate(raw_event_id) for raw_event_id in ids]
+    return {
+        "ok": all(item.get("ok") for item in results),
+        "message": f"已补验 {len(results)} 条来源行",
+        "results": results,
+    }
+
+
+@router.get("/webhook-ingest/formal")
+def pipeline_query_formal(event_type: str, date_str: str | None = None) -> dict[str, Any]:
+    """仅查询正式分区（只含已确认结构字段），用于当日核对。"""
+    from app.services.data_lake_sink import DataLakeSinkService
+    return DataLakeSinkService().query_formal_data(event_type, date_str)
 
 
 @router.post("/batch-ingest-to-lake")

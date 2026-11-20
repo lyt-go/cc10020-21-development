@@ -29,9 +29,14 @@ class DataLakeSinkService(BaseModuleService):
 
     def __init__(self) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
-        os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
+
+    @property
+    def _lake_base(self) -> str:
+        """数据湖根目录跟随 json_store，测试注入临时存储时不会写进仓库目录。"""
+        base = os.path.join(str(json_store.base_dir), "lake")
+        os.makedirs(base, exist_ok=True)
+        return base
 
     def write_event(self, event_id: str, event_type: str, payload: dict[str, Any],
                     source_channel_id: int = 0) -> dict[str, Any]:
@@ -86,6 +91,142 @@ class DataLakeSinkService(BaseModuleService):
             }
         except OSError as e:
             return {"ok": False, "message": f"写入失败: {e}", "partition": "", "file_path": ""}
+
+    def write_formal_event(
+        self,
+        event_id: str,
+        event_type: str,
+        confirmed_payload: dict[str, Any],
+        *,
+        source_channel_id: int = 0,
+        raw_event_id: int = 0,
+        confirmed_scope: dict[str, Any] | None = None,
+        pending_fields: list[str] | None = None,
+        schema_versions: list[str] | None = None,
+        supplemental: bool = False,
+        replace_previous: bool = False,
+    ) -> dict[str, Any]:
+        """只把已确认结构的字段写入正式分区。
+
+        正式分区 = `_lake_base/formal/<event_type>/<YYYY/MM/DD>`，与原始接入
+        （webhook_ingest_raw）分开存放：未经结构确认的字段不会出现在这里，
+        下游按订单号/金额做当日核对时只看正式分区即可。
+
+        每条记录都带 `raw_event_id` 回指最初收到的来源行，便于从正式数据
+        追到原文和补验前后的结构结论。`replace_previous=True` 用于补验：
+        同一来源行只保留一条生效记录，避免旧版本（缺字段）和新版本同时被消费。
+        """
+        if not confirmed_payload:
+            return {
+                "ok": True, "message": "无已确认结构字段，未写入正式分区",
+                "partition": "", "file_path": "", "written_fields": [], "superseded": [],
+            }
+        now = datetime.now(timezone.utc)
+        date_partition = now.strftime("%Y/%m/%d")
+        partition = f"formal/{event_type}/{date_partition}"
+        partition_path = os.path.join(self._lake_base, partition)
+        os.makedirs(partition_path, exist_ok=True)
+
+        superseded: list[str] = []
+        if replace_previous and raw_event_id:
+            superseded = self._supersede_formal_records(partition_path, raw_event_id, confirmed_payload)
+
+        record = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "source_channel_id": source_channel_id,
+            "raw_event_id": raw_event_id,
+            "payload": confirmed_payload,
+            "confirmed_fields": sorted(confirmed_payload.keys()),
+            "confirmed_scope": confirmed_scope or {},
+            "pending_fields": list(pending_fields or []),
+            "schema_versions": list(schema_versions or []),
+            "supplemental": supplemental,
+            "supersedes": superseded,
+            "status": "生效",
+            "ingested_at": now.isoformat(),
+            "record_hash": hashlib.sha256(
+                json.dumps(confirmed_payload, sort_keys=True, ensure_ascii=False,
+                           default=str).encode()
+            ).hexdigest()[:16],
+        }
+        file_name = (
+            f"{'supp' if supplemental else 'evt'}_{now.strftime('%H%M%S%f')}_{event_id[:8]}.json"
+        )
+        file_path = os.path.join(partition_path, file_name)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, default=str)
+            self._write_stats[event_type] = self._write_stats.get(event_type, 0) + 1
+            return {
+                "ok": True,
+                "message": f"已确认结构字段写入正式分区 {date_partition}",
+                "partition": partition,
+                "file_path": file_path,
+                "written_fields": sorted(confirmed_payload.keys()),
+                "record_hash": record["record_hash"],
+                "superseded": superseded,
+            }
+        except OSError as e:
+            return {"ok": False, "message": f"正式分区写入失败: {e}",
+                    "partition": partition, "file_path": "", "written_fields": [],
+                    "superseded": []}
+
+    def _supersede_formal_records(self, partition_path: str, raw_event_id: int,
+                                  confirmed_payload: dict[str, Any]) -> list[str]:
+        """把同一来源行的旧正式记录标记为已取代，保证一条来源行只有一条生效记录。"""
+        superseded: list[str] = []
+        if not os.path.isdir(partition_path):
+            return superseded
+        for fname in sorted(os.listdir(partition_path)):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(partition_path, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if isinstance(existing, list):
+                continue
+            if int(existing.get("raw_event_id", 0)) != raw_event_id:
+                continue
+            if existing.get("status") != "生效":
+                continue
+            existing["status"] = "已取代"
+            existing["superseded_at"] = datetime.now(timezone.utc).isoformat()
+            existing["superseded_by_payload"] = confirmed_payload
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(existing, f, ensure_ascii=False, default=str)
+                superseded.append(path)
+            except OSError:
+                continue
+        return superseded
+
+    def query_formal_data(self, event_type: str, date_str: str | None = None,
+                          limit: int = 100, include_superseded: bool = False) -> dict[str, Any]:
+        """查询正式分区数据（只含已确认结构字段，默认只返回生效记录）。"""
+        if date_str is None:
+            date_str = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+        partition = f"formal/{event_type}/{date_str}"
+        partition_path = os.path.join(self._lake_base, partition)
+        if not os.path.exists(partition_path):
+            return {"ok": True, "records": [], "total": 0, "partition": partition}
+
+        records = []
+        for fname in sorted(os.listdir(partition_path))[:limit]:
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(partition_path, fname), "r", encoding="utf-8") as f:
+                        record = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if isinstance(record, dict) and not include_superseded \
+                        and record.get("status", "生效") != "生效":
+                    continue
+                records.append(record)
+        return {"ok": True, "records": records, "total": len(records), "partition": partition}
 
     def write_batch(self, records: list[dict[str, Any]], event_type: str = "batch",
                     source_channel_id: int = 0) -> dict[str, Any]:
@@ -166,6 +307,8 @@ class DataLakeSinkService(BaseModuleService):
         total_files = 0
         total_size = 0
         by_type: dict[str, int] = {}
+        formal_files = 0
+        unknown_quarantined_files = 0
 
         for root, dirs, files in os.walk(self._lake_base):
             for f in files:
@@ -184,6 +327,10 @@ class DataLakeSinkService(BaseModuleService):
                     if len(parts) > idx + 1:
                         etype = parts[idx + 1]
                         by_type[etype] = by_type.get(etype, 0) + 1
+                if "formal" in parts:
+                    formal_files += 1
+                if "quarantine" in parts:
+                    unknown_quarantined_files += 1
 
         return {
             "base_dir": self._lake_base,
@@ -192,6 +339,8 @@ class DataLakeSinkService(BaseModuleService):
             "total_size_mb": round(total_size / (1024 * 1024), 2),
             "by_type": dict(sorted(by_type.items(), key=lambda x: x[1], reverse=True)),
             "write_stats": self._write_stats,
+            "formal_files": formal_files,
+            "quarantined_files": unknown_quarantined_files,
         }
 
     def get_partition_info(self) -> list[dict[str, Any]]:
@@ -224,6 +373,10 @@ class DataLakeSinkService(BaseModuleService):
                 by_status[s] += 1
 
         lake_stats = self.get_lake_stats()
+        from app.services.ingest_validation import (AWAITING_REVIEW, PENDING_MODULE,
+                                                    RAW_MODULE)
+        raw_rows = json_store.get_all(RAW_MODULE)
+        pending_rows = json_store.get_all(PENDING_MODULE)
         return {
             "module": self.MODULE,
             "entity": self.ENTITY,
@@ -233,5 +386,10 @@ class DataLakeSinkService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "lake_files": lake_stats.get("total_files", 0),
             "lake_size_mb": lake_stats.get("total_size_mb", 0),
+            "formal_files": lake_stats.get("formal_files", 0),
+            "raw_records": len(raw_rows),
+            "pending_records": len(pending_rows),
+            "pending_unknown_fields": sum(
+                1 for r in raw_rows if r.get("结构校验状态") == AWAITING_REVIEW),
             "operation": self.OPERATION_TERM,
         }

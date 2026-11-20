@@ -14,6 +14,8 @@ from typing import Any
 
 from app.persistence import json_store
 from app.services.base import BaseModuleService
+from app.services.ingest_validation import RAW_MODULE, IngestValidationService
+from app.store import store
 
 
 class WebhookChannelService(BaseModuleService):
@@ -38,21 +40,26 @@ class WebhookChannelService(BaseModuleService):
         完整流程：
         1. 通道状态校验
         2. 签名验证（HMAC-SHA256或RAW）
-        3. Payload结构校验
-        4. 事件去重判定
-        5. 分发规则匹配
-        6. 数据落湖
+        3. 原始接入留存（先落原文，再做结构校验）
+        4. 事件结构校验：区分已确认结构范围和未知字段，生成未知字段处置明细
+        5. 事件去重判定
+        6. 分发规则匹配
+        7. 已确认字段写入正式分区；待补验内容同步到待处理清单
 
-        返回处理结果包含完整的处理轨迹。
+        结构校验未通过或中断时不再直接丢弃事件：原始数据已留存，
+        结果里带 raw_event_id，可通过补验接口继续处理。
         """
-        channel = json_store.get_by_id(self.MODULE, channel_id)
+        channel = self._resolve_channel(channel_id)
         if channel is None:
             return {"ok": False, "message": f"通道 {channel_id} 不存在", "event_id": None, "stage": "通道校验"}
 
         if channel.get("status") != "已启用":
             return {"ok": False, "message": f"通道 {channel_id} 未启用（当前状态: {channel['status']}）", "event_id": None, "stage": "状态校验"}
 
+        event_type = str(payload.get("type") or payload.get("event_type", "unknown"))
+        event_id = str(uuid.uuid4())
         trace: list[dict[str, Any]] = []
+        ingest_svc = IngestValidationService()
 
         # 阶段1：签名验证
         secret = str(channel.get("签名密钥", ""))
@@ -60,35 +67,106 @@ class WebhookChannelService(BaseModuleService):
         sign_ok = self._verify_signature(payload, signature, secret, verify_method)
         trace.append({"stage": "签名验证", "passed": sign_ok, "method": verify_method})
 
-        if not sign_ok and verify_method != "NONE":
-            self._record_receive_event(channel_id, payload, "signature_failed", trace)
-            return {"ok": False, "message": "签名验证失败", "event_id": None, "stage": "签名验证", "trace": trace}
+        # 阶段2：原始接入留存（在任何校验结论产生之前）
+        raw = ingest_svc.record_raw_event(
+            channel_id=channel_id, event_type=event_type, payload=payload, event_id=event_id)
+        raw_event_id = int(raw["id"])
+        trace.append({"stage": "原始接入留存", "passed": True,
+                      "detail": raw.get("原始接入编号"), "raw_event_id": raw_event_id})
 
-        # 阶段2：事件结构校验（跨模块：event_schema）
-        event_type = payload.get("type") or payload.get("event_type", "unknown")
-        schema_validation = self._validate_event_schema(channel_id, event_type, payload)
-        trace.append({"stage": "结构校验", "passed": schema_validation["ok"], "detail": schema_validation.get("message")})
+        if not sign_ok and verify_method != "NONE":
+            ingest_svc.apply_validation(
+                raw_event_id,
+                {"ok": False, "schema_found": False, "message": "签名验证失败，未进入结构校验",
+                 "pending_reason": "签名验证失败"},
+                conclusion_kind="签名验证失败", interrupted=True, outcome="signature_failed")
+            self._record_receive_event(channel_id, payload, "signature_failed", trace)
+            return {"ok": False, "message": "签名验证失败", "event_id": None,
+                    "raw_event_id": raw_event_id, "stage": "签名验证", "trace": trace}
+
+        # 阶段3：事件结构校验（跨模块：event_schema）
+        schema_validation, interrupted = self._validate_event_schema(
+            channel_id, event_type, payload)
+        if interrupted:
+            trace.append({"stage": "结构校验", "passed": False, "interrupted": True,
+                          "detail": schema_validation.get("message")})
+            updated = ingest_svc.apply_validation(
+                raw_event_id, schema_validation, conclusion_kind="结构校验中断",
+                interrupted=True, outcome="schema_interrupted")
+            self._record_receive_event(channel_id, payload, "schema_invalid", trace)
+            return {
+                "ok": False,
+                "message": f"结构校验中断，原始接入数据已留存可补验: {schema_validation.get('message')}",
+                "event_id": event_id,
+                "raw_event_id": raw_event_id,
+                "stage": "结构校验",
+                "trace": trace,
+                "pending": ingest_svc.pending_for(raw_event_id),
+                "unknown_fields": ingest_svc.list_unknown_fields(raw_event_id=raw_event_id),
+                "raw_event": updated,
+            }
+
+        updated = ingest_svc.apply_validation(
+            raw_event_id, schema_validation, conclusion_kind="初次校验",
+            interrupted=False, outcome=None) or raw
+        trace.append({
+            "stage": "结构校验",
+            "passed": schema_validation["ok"],
+            "detail": schema_validation.get("message"),
+            "confirmed_fields": schema_validation.get("confirmed_fields", []),
+            "unknown_fields": [u["field"] for u in schema_validation.get("unknown_fields", [])],
+            "pending_reason": schema_validation.get("pending_reason", ""),
+        })
 
         if not schema_validation["ok"]:
             self._record_receive_event(channel_id, payload, "schema_invalid", trace)
-            return {"ok": False, "message": f"事件结构校验失败: {schema_validation['message']}", "event_id": None, "stage": "结构校验", "trace": trace}
+            return {
+                "ok": False,
+                "message": f"事件结构校验失败，原始接入数据已留存可补验: {schema_validation['message']}",
+                "event_id": event_id,
+                "raw_event_id": raw_event_id,
+                "stage": "结构校验",
+                "trace": trace,
+                "pending": ingest_svc.pending_for(raw_event_id),
+                "unknown_fields": ingest_svc.list_unknown_fields(raw_event_id=raw_event_id),
+                "raw_event": updated,
+            }
 
-        # 阶段3：去重判定（跨模块：dedup_filter）
-        event_id = str(uuid.uuid4())
+        # 阶段4：去重判定（跨模块：dedup_filter）
         dedup_result = self._check_dedup(channel_id, event_type, payload)
         trace.append({"stage": "去重判定", "passed": dedup_result["ok"], "is_duplicate": dedup_result.get("is_duplicate")})
 
         if dedup_result.get("is_duplicate"):
+            json_store.update(RAW_MODULE, raw_event_id, {"处理结论": "duplicate"})
             self._record_receive_event(channel_id, payload, "duplicate", trace)
-            return {"ok": True, "message": "事件已去重（重复事件）", "event_id": event_id, "stage": "去重判定", "trace": trace, "skipped": True}
+            return {"ok": True, "message": "事件已去重（重复事件）", "event_id": event_id,
+                    "raw_event_id": raw_event_id, "stage": "去重判定", "trace": trace, "skipped": True}
 
-        # 阶段4：分发路由（跨模块：dispatch_rule）
+        # 阶段5：分发路由（跨模块：dispatch_rule）
         dispatch_targets = self._match_dispatch_rules(event_type, payload)
         trace.append({"stage": "分发路由", "targets": len(dispatch_targets), "routes": [t.get("目标系统") for t in dispatch_targets]})
 
-        # 阶段5：数据落湖（跨模块：data_lake_sink）
-        sink_result = self._sink_event(event_id, event_type, payload, channel_id)
-        trace.append({"stage": "数据落湖", "passed": sink_result["ok"], "detail": sink_result.get("message")})
+        # 阶段6：已确认字段写入正式分区（跨模块：data_lake_sink）
+        usable_fields = dict(schema_validation.get("usable_fields") or {})
+        sink_result = self._sink_event(
+            event_id, event_type, usable_fields, channel_id,
+            raw_event_id=raw_event_id,
+            confirmed_scope=schema_validation.get("confirmed_scope") or {},
+            pending_fields=schema_validation.get("pending_fields") or [],
+            schema_versions=schema_validation.get("schema_versions") or [],
+        )
+        if sink_result.get("written_fields"):
+            ingest_svc.mark_formal_write(
+                raw_event_id,
+                fields=list(sink_result["written_fields"]),
+                partition=str(sink_result.get("partition", "")),
+                file_path=str(sink_result.get("file_path", "")),
+            )
+        # 落湖后刷新来源行结论（补全已入湖字段），不再重复追加校验结论
+        ingest_svc.refresh_pending(raw_event_id)
+        trace.append({"stage": "数据落湖", "passed": sink_result["ok"],
+                      "detail": sink_result.get("message"),
+                      "written_fields": sink_result.get("written_fields", [])})
 
         # 记录成功接收
         self._record_receive_event(channel_id, payload, "success", trace)
@@ -97,14 +175,38 @@ class WebhookChannelService(BaseModuleService):
             "total_received": int(channel.get("total_received", 0)) + 1,
         })
 
+        unknown_fields = schema_validation.get("unknown_fields") or []
+        if unknown_fields:
+            message = (
+                f"事件已接收：{len(usable_fields)} 个已确认字段进入正式分区，"
+                f"{len(unknown_fields)} 个未知字段待补验"
+            )
+        else:
+            message = f"事件接收成功，已路由至 {len(dispatch_targets)} 个目标系统"
+
+        final_raw = json_store.get_by_id(RAW_MODULE, raw_event_id) or updated
         return {
             "ok": True,
-            "message": f"事件接收成功，已路由至 {len(dispatch_targets)} 个目标系统",
+            "message": message,
             "event_id": event_id,
+            "raw_event_id": raw_event_id,
+            "原始接入编号": final_raw.get("原始接入编号"),
             "stage": "完成",
             "trace": trace,
             "dispatch_targets": [t.get("目标系统") for t in dispatch_targets],
+            "confirmed_scope": schema_validation.get("confirmed_scope"),
+            "confirmed_fields": schema_validation.get("confirmed_fields", []),
+            "unknown_fields": unknown_fields,
+            "pending_reason": schema_validation.get("pending_reason", ""),
+            "pending": ingest_svc.pending_for(raw_event_id),
         }
+
+    def _resolve_channel(self, channel_id: int) -> dict[str, Any] | None:
+        """通道可能在内存仓库（资源接口登记）或持久化分区（管道用例）里，两处都查。"""
+        channel = json_store.get_by_id(self.MODULE, channel_id)
+        if channel is not None:
+            return channel
+        return store.find(self.MODULE, channel_id)
 
     def _verify_signature(self, payload: dict[str, Any], signature: str | None,
                           secret: str, method: str) -> bool:
@@ -125,14 +227,29 @@ class WebhookChannelService(BaseModuleService):
             return hmac.compare_digest(expected, signature)
         return False
 
-    def _validate_event_schema(self, channel_id: int, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """跨模块调用event_schema进行事件结构校验。"""
+    def _validate_event_schema(self, channel_id: int, event_type: str,
+                               payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """跨模块调用event_schema进行事件结构校验。
+
+        返回 (校验结果, 是否中断)。Schema服务不可用属于“校验中断”，
+        不能当作校验通过，否则未知字段会绕过补验直接进入取数。
+        """
         try:
             from app.services.event_schema import EventSchemaService
             schema_svc = EventSchemaService()
-            return schema_svc.validate_event(channel_id, event_type, payload)
+            return schema_svc.validate_event(channel_id, event_type, payload), False
         except Exception as e:
-            return {"ok": True, "message": f"结构校验跳过（Schema服务不可用: {e}）"}
+            return {
+                "ok": False,
+                "schema_found": False,
+                "message": f"Schema服务不可用: {e}",
+                "confirmed_fields": [],
+                "unknown_fields": [],
+                "usable_fields": {},
+                "pending_fields": [],
+                "confirmed_scope": {},
+                "pending_reason": "结构校验中断（Schema服务不可用）",
+            }, True
 
     def _check_dedup(self, channel_id: int, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """跨模块调用dedup_filter进行事件去重判定。"""
@@ -152,14 +269,25 @@ class WebhookChannelService(BaseModuleService):
         except Exception:
             return []
 
-    def _sink_event(self, event_id: str, event_type: str, payload: dict[str, Any], channel_id: int) -> dict[str, Any]:
-        """跨模块调用data_lake_sink进行事件数据落湖。"""
+    def _sink_event(self, event_id: str, event_type: str, payload: dict[str, Any],
+                    channel_id: int, *, raw_event_id: int = 0,
+                    confirmed_scope: dict[str, Any] | None = None,
+                    pending_fields: list[str] | None = None,
+                    schema_versions: list[str] | None = None) -> dict[str, Any]:
+        """跨模块调用data_lake_sink，只把已确认结构字段写入正式分区。"""
         try:
             from app.services.data_lake_sink import DataLakeSinkService
             sink_svc = DataLakeSinkService()
-            return sink_svc.write_event(event_id, event_type, payload, source_channel_id=channel_id)
+            return sink_svc.write_formal_event(
+                event_id, event_type, payload,
+                source_channel_id=channel_id,
+                raw_event_id=raw_event_id,
+                confirmed_scope=confirmed_scope or {},
+                pending_fields=pending_fields or [],
+                schema_versions=schema_versions or [],
+            )
         except Exception as e:
-            return {"ok": False, "message": f"落湖失败: {e}"}
+            return {"ok": False, "message": f"落湖失败: {e}", "written_fields": []}
 
     def _record_receive_event(self, channel_id: int, payload: dict[str, Any],
                               outcome: str, trace: list[dict[str, Any]]) -> None:
@@ -176,7 +304,7 @@ class WebhookChannelService(BaseModuleService):
 
     def get_channel_stats(self, channel_id: int) -> dict[str, Any]:
         """获取通道的接收统计信息。"""
-        channel = json_store.get_by_id(self.MODULE, channel_id)
+        channel = self._resolve_channel(channel_id)
         if channel is None:
             return {"ok": False, "message": f"通道 {channel_id} 不存在"}
 
